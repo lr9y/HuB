@@ -3,7 +3,6 @@ import os
 import re
 import shutil
 import sqlite3
-import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -441,6 +440,7 @@ class HubBot(commands.Bot):
         self.badwords = self.load_badwords()
         self.fast_msgs = defaultdict(deque)
         self.global_msgs = deque(maxlen=300)
+        self._last_load_state = False
 
     def cfg_int(self, key: str) -> int:
         return self.db.get_config(key, int)
@@ -459,6 +459,7 @@ class HubBot(commands.Bot):
     async def setup_hook(self):
         self.add_view(VerifyView(self))
         guild = discord.Object(id=self.cfg_int("guild_id"))
+        self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         self.verify_timeout_worker.start()
         self.backup_worker.start()
@@ -529,7 +530,9 @@ class HubBot(commands.Bot):
     async def backup_worker(self):
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_db = BACKUPS_DIR / f"bot_{stamp}.db"
-        shutil.copy2(DB_PATH, backup_db)
+        backup_conn = sqlite3.connect(backup_db)
+        self.db.conn.backup(backup_conn)
+        backup_conn.close()
         conf_file = BACKUPS_DIR / f"config_{stamp}.json"
         conf_file.write_text(self.db.dump_config_json(), encoding="utf-8")
         backups = sorted(BACKUPS_DIR.glob("bot_*.db"))
@@ -565,15 +568,6 @@ def admin_check():
     return app_commands.check(predicate)
 
 
-def slash_alias(name: str, target_desc: str):
-    @bot.tree.command(name=name, description=f"Alias for {target_desc}")
-    async def _alias(interaction: discord.Interaction):
-        if name == "t":
-            await top(interaction, scope="all")
-        elif name == "p":
-            await profile(interaction, user=None)
-
-
 def can_run_heavy(interaction: discord.Interaction) -> bool:
     return not bot.db.get_setting("load_shedding") or interaction.user.id == bot.cfg_int("owner_id")
 
@@ -585,13 +579,46 @@ async def on_ready():
     if guild:
         channel = guild.get_channel(bot.cfg_int("verification_channel"))
         if isinstance(channel, discord.TextChannel):
-            e = discord.Embed(title="Verification", description="اضغط زر Verify للتفعيل", color=discord.Color.blurple())
-            await channel.send(embed=e, view=VerifyView(bot))
+            should_send = True
+            async for msg in channel.history(limit=30):
+                if msg.author.id != bot.user.id:
+                    continue
+                if not msg.components:
+                    continue
+                for row in msg.components:
+                    for comp in row.children:
+                        if getattr(comp, "custom_id", "") == "lry_verify_btn":
+                            should_send = False
+                            break
+                    if not should_send:
+                        break
+                if not should_send:
+                    break
+            if should_send:
+                e = discord.Embed(title="Verification", description="اضغط زر Verify للتفعيل", color=discord.Color.blurple())
+                await channel.send(embed=e, view=VerifyView(bot))
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel):
+    await bot.send_log(bot.cfg_int("channel_log"), discord.Embed(title="Channel Created", description=f"{channel.name} ({channel.id})", color=discord.Color.green()))
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel):
+    await bot.send_log(bot.cfg_int("channel_log"), discord.Embed(title="Channel Deleted", description=f"{channel.name} ({channel.id})", color=discord.Color.red()))
 
 
 @bot.event
 async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
     bot.db.track_command(interaction.user.id, command.qualified_name)
+
+
+@bot.tree.interaction_check
+async def global_interaction_check(interaction: discord.Interaction) -> bool:
+    if bot.db.is_blacklisted(interaction.user.id):
+        raise app_commands.CheckFailure("blacklisted")
+    return True
 
 
 @bot.event
@@ -791,6 +818,27 @@ async def help_cmd(interaction: discord.Interaction):
         "`/lock /unlock /slowmode /slowoff /hide /unhide /nick /role /removerole /disconnect`\n"
         "`/antispam /antilink /blacklist_add /blacklist_remove /sync_add /sync_remove /config_set`"
     )
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="ping", description="فحص استجابة البوت")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong: {latency}ms", ephemeral=True)
+
+
+@bot.tree.command(name="health", description="حالة الأداء والضغط")
+@admin_check()
+async def health(interaction: discord.Interaction):
+    cpu = psutil.cpu_percent(interval=None)
+    ram = psutil.virtual_memory().percent
+    load = "ON" if bot.db.get_setting("load_shedding") else "OFF"
+    backups = len(list(BACKUPS_DIR.glob("bot_*.db")))
+    e = discord.Embed(title="Bot Health", color=discord.Color.blurple())
+    e.add_field(name="CPU", value=f"{cpu:.1f}%")
+    e.add_field(name="RAM", value=f"{ram:.1f}%")
+    e.add_field(name="Load Protection", value=load)
+    e.add_field(name="Backups", value=str(backups))
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -1174,6 +1222,11 @@ async def on_tree_error(interaction: discord.Interaction, error: app_commands.Ap
     await bot.debug("Command Error", f"{type(error).__name__}: {error}")
     if not interaction.response.is_done():
         await interaction.response.send_message("حدث خطأ داخلي", ephemeral=True)
+
+
+@bot.event
+async def on_error(event_method: str, *args, **kwargs):
+    await bot.debug("Event Error", f"Unhandled error in `{event_method}`")
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")

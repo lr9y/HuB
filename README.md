@@ -31,6 +31,7 @@ python bot.py
 - Security إضافي: new account detector, short link/invite/caps/emoji/cross-spam/name-change limits.
 - Confirm ban بزر (`/ban_confirm`).
 - Blacklist system لمستخدمي البوت.
+- أوامر فحص مباشرة: `/ping` و `/health`.
 
 ## ملاحظة
 تأكد من تفعيل Message Content Intent في Developer Portal.
