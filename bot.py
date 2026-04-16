@@ -497,9 +497,7 @@ class HubBot(commands.Bot):
         while self.global_msgs and now - self.global_msgs[0] > 10:
             self.global_msgs.popleft()
         load_shedding = len(self.global_msgs) >= threshold
-        if load_shedding != self._last_load_state:
-            self.db.set_setting("load_shedding", load_shedding)
-            self._last_load_state = load_shedding
+        self.db.set_setting("load_shedding", load_shedding)
         return load_shedding
 
     @tasks.loop(minutes=1)
